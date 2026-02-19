@@ -1,0 +1,10 @@
+{
+  "name": "sc-bridge",
+  "version": "1.0.0",
+  "main": "server.js",
+  "dependencies": {
+    "hyperswarm": "^4.7.15",
+    "hypercore-crypto": "^3.4.2",
+    "ws": "^8.18.0"
+  }
+}
