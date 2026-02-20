@@ -21,22 +21,43 @@ if (fs.existsSync(KEYFILE)) {
 const swarm = new Hyperswarm({ keyPair })
 const startTime = Date.now()
 
+// ===== NETWORK OBSERVATORY STORAGE =====
+
 // Track connected peers with metadata
 const peers = new Map() // peerId -> { publicKey, conn, connectedAt, lastSeen, metadata, topics }
 
+// Agent Registry - discovered agents with full metadata
+const agents = new Map() // agentId -> { id, name, type, capabilities, publicKey, topics, firstSeen, lastSeen, metadata }
+
+// Message Archive - recent messages across all topics (configurable limit)
+const MESSAGE_LIMIT = 1000
+const messages = [] // Array of { id, timestamp, topic, sender, content, metadata }
+
+// Activity Tracker
+const activity = {
+  messagesReceived: 0,
+  messagesSent: 0,
+  agentsDiscovered: 0,
+  topicsDiscovered: 0,
+  startTime: Date.now(),
+  hourlyStats: new Map() // hour -> { messages, agents, topics }
+}
+
 // Track topics/channels
-const topics = new Map() // topicKey -> { name, key, discovery, peers: Set(), joinedAt }
+const topics = new Map() // topicKey -> { name, key, discovery, peers: Set(), joinedAt, messageCount, lastActivity }
 const topicDiscoveries = new Map() // topicKey -> discovery object from swarm
 
-// Discovery topic for announcing public channels
-const DISCOVERY_TOPIC = 'sc-bridge-discovery'
-// Create 32-byte key from topic name using hash
-const topicHash = require('crypto').createHash('sha256').update(DISCOVERY_TOPIC).digest()
-const discoveryTopicKey = crypto.discoveryKey(topicHash)
+// Common agent topics to auto-join
+const AUTO_JOIN_TOPICS = [
+  'sc-bridge-discovery',
+  'agent-marketplace',
+  'agent-announce',
+  'intercom-global',
+  'agent-network'
+]
 
 // Helper: Create topic key from name
 function getTopicKey(topicName) {
-  // Hash the topic name to create a 32-byte key
   const topicHash = require('crypto').createHash('sha256').update(topicName).digest()
   return crypto.discoveryKey(topicHash)
 }
@@ -52,8 +73,8 @@ function joinTopic(topicName, options = {}) {
   }
   
   const discovery = swarm.join(topicKey, { 
-    server: options.server !== false, // default true
-    client: options.client !== false  // default true
+    server: options.server !== false,
+    client: options.client !== false
   })
   
   topics.set(topicKeyHex, {
@@ -63,12 +84,17 @@ function joinTopic(topicName, options = {}) {
     peers: new Set(),
     joinedAt: new Date().toISOString(),
     server: options.server !== false,
-    client: options.client !== false
+    client: options.client !== false,
+    messageCount: 0,
+    lastActivity: new Date().toISOString()
   })
   
   topicDiscoveries.set(topicKeyHex, discovery)
   
   console.log(`[topic] joined: ${topicName} (${topicKeyHex.slice(0, 16)}...)`)
+  
+  // Track topic discovery
+  activity.topicsDiscovered++
   
   // Notify WebSocket clients
   const joinEvent = JSON.stringify({
@@ -81,7 +107,6 @@ function joinTopic(topicName, options = {}) {
     }
   })
   
-  // Only notify clients if they exist (after WebSocket server is initialized)
   if (typeof clients !== 'undefined') {
     clients.forEach(ws => {
       if (ws.readyState === 1) ws.send(joinEvent)
@@ -111,7 +136,6 @@ function leaveTopic(topicName) {
   
   console.log(`[topic] left: ${topicName}`)
   
-  // Notify WebSocket clients
   const leaveEvent = JSON.stringify({
     type: 'topic-left',
     id: 'evt-' + Date.now(),
@@ -122,7 +146,6 @@ function leaveTopic(topicName) {
     }
   })
   
-  // Only notify clients if they exist (after WebSocket server is initialized)
   if (typeof clients !== 'undefined') {
     clients.forEach(ws => {
       if (ws.readyState === 1) ws.send(leaveEvent)
@@ -130,6 +153,103 @@ function leaveTopic(topicName) {
   }
   
   return true
+}
+
+// Helper: Register or update agent in registry
+function registerAgent(agentData) {
+  const agentId = agentData.publicKey || agentData.id || agentData.agentId
+  
+  if (!agentId) {
+    console.warn('[agent-registry] Cannot register agent without ID')
+    return
+  }
+  
+  const now = new Date().toISOString()
+  
+  if (agents.has(agentId)) {
+    // Update existing agent
+    const agent = agents.get(agentId)
+    agent.lastSeen = now
+    agent.metadata = { ...agent.metadata, ...agentData.metadata }
+    if (agentData.topics) {
+      agent.topics = Array.isArray(agentData.topics) ? agentData.topics : Array.from(agentData.topics)
+    }
+    console.log(`[agent-registry] updated: ${agentData.name || agentId.slice(0, 16)}`)
+  } else {
+    // Register new agent
+    agents.set(agentId, {
+      id: agentId,
+      name: agentData.name || `Agent-${agentId.slice(0, 8)}`,
+      type: agentData.type || 'unknown',
+      capabilities: agentData.capabilities || [],
+      publicKey: agentId,
+      topics: agentData.topics || [],
+      firstSeen: now,
+      lastSeen: now,
+      metadata: agentData.metadata || {}
+    })
+    
+    activity.agentsDiscovered++
+    console.log(`[agent-registry] discovered: ${agentData.name || agentId.slice(0, 16)}`)
+    
+    // Notify WebSocket clients
+    const announceEvent = JSON.stringify({
+      type: 'agent-discovered',
+      id: 'evt-' + Date.now(),
+      timestamp: now,
+      payload: agents.get(agentId)
+    })
+    
+    if (typeof clients !== 'undefined') {
+      clients.forEach(ws => {
+        if (ws.readyState === 1) ws.send(announceEvent)
+      })
+    }
+  }
+}
+
+// Helper: Archive message
+function archiveMessage(messageData) {
+  const messageId = messageData.id || `msg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+  
+  const message = {
+    id: messageId,
+    timestamp: messageData.timestamp || new Date().toISOString(),
+    topic: messageData.topic || 'unknown',
+    sender: messageData.sender || messageData.source || 'unknown',
+    content: messageData.content || messageData.payload || messageData,
+    metadata: messageData.metadata || {},
+    type: messageData.type || 'message'
+  }
+  
+  messages.push(message)
+  
+  // Enforce message limit
+  if (messages.length > MESSAGE_LIMIT) {
+    messages.shift() // Remove oldest message
+  }
+  
+  activity.messagesReceived++
+  
+  // Update topic activity
+  const topicKey = message.topic
+  if (topics.has(topicKey)) {
+    const topic = topics.get(topicKey)
+    topic.messageCount++
+    topic.lastActivity = message.timestamp
+  }
+  
+  // Update hourly stats
+  const hour = new Date().toISOString().slice(0, 13) // YYYY-MM-DDTHH
+  if (!activity.hourlyStats.has(hour)) {
+    activity.hourlyStats.set(hour, { messages: 0, agents: new Set(), topics: new Set() })
+  }
+  const hourStats = activity.hourlyStats.get(hour)
+  hourStats.messages++
+  hourStats.agents.add(message.sender)
+  hourStats.topics.add(message.topic)
+  
+  console.log(`[message-archive] stored: ${messageId.slice(0, 16)} from ${message.sender.slice(0, 8)}`)
 }
 
 // Create HTTP server with multiple endpoints
@@ -145,7 +265,8 @@ const server = http.createServer((req, res) => {
       status: 'ok',
       publicKey: keyPair.publicKey.toString('hex').slice(0, 16) + '...',
       clients: clients.size,
-      uptime: process.uptime()
+      uptime: process.uptime(),
+      mode: 'observatory'
     }))
   } 
   else if (req.url === '/peers') {
@@ -164,6 +285,153 @@ const server = http.createServer((req, res) => {
       peers: peerList
     }))
   }
+  else if (req.url === '/agents') {
+    // NEW: Agent registry endpoint
+    const agentList = Array.from(agents.values()).map(a => ({
+      id: a.id,
+      name: a.name,
+      type: a.type,
+      capabilities: a.capabilities,
+      publicKey: a.publicKey,
+      topics: a.topics,
+      firstSeen: a.firstSeen,
+      lastSeen: a.lastSeen,
+      uptime: Date.now() - new Date(a.firstSeen).getTime(),
+      metadata: a.metadata
+    }))
+    res.writeHead(200)
+    res.end(JSON.stringify({
+      count: agentList.length,
+      agents: agentList
+    }))
+  }
+  else if (req.url.startsWith('/agents/')) {
+    // NEW: Get specific agent details
+    const agentId = req.url.split('/agents/')[1]
+    const agent = agents.get(agentId)
+    
+    if (!agent) {
+      res.writeHead(404)
+      res.end(JSON.stringify({ error: 'Agent not found' }))
+      return
+    }
+    
+    res.writeHead(200)
+    res.end(JSON.stringify(agent))
+  }
+  else if (req.url.startsWith('/messages')) {
+    // NEW: Message archive endpoint with filters
+    const url = new URL(req.url, `http://${req.headers.host}`)
+    const topic = url.searchParams.get('topic')
+    const sender = url.searchParams.get('sender')
+    const limit = parseInt(url.searchParams.get('limit') || '100')
+    const offset = parseInt(url.searchParams.get('offset') || '0')
+    
+    let filtered = messages
+    
+    if (topic) {
+      filtered = filtered.filter(m => m.topic === topic)
+    }
+    
+    if (sender) {
+      filtered = filtered.filter(m => m.sender === sender)
+    }
+    
+    const paginated = filtered.slice(offset, offset + limit)
+    
+    res.writeHead(200)
+    res.end(JSON.stringify({
+      total: filtered.length,
+      offset: offset,
+      limit: limit,
+      messages: paginated
+    }))
+  }
+  else if (req.url === '/activity') {
+    // NEW: Network activity metrics
+    const uptime = Date.now() - activity.startTime
+    const messagesPerSecond = activity.messagesReceived / (uptime / 1000)
+    
+    res.writeHead(200)
+    res.end(JSON.stringify({
+      uptime: uptime,
+      messagesReceived: activity.messagesReceived,
+      messagesSent: activity.messagesSent,
+      messagesPerSecond: messagesPerSecond.toFixed(2),
+      agentsDiscovered: activity.agentsDiscovered,
+      topicsDiscovered: activity.topicsDiscovered,
+      currentAgents: agents.size,
+      currentTopics: topics.size,
+      currentPeers: peers.size,
+      currentClients: clients.size,
+      archivedMessages: messages.length
+    }))
+  }
+  else if (req.url === '/graph') {
+    // NEW: Network graph data (nodes + edges)
+    const nodes = []
+    const edges = []
+    
+    // Add bridge as central node
+    nodes.push({
+      id: 'bridge',
+      type: 'bridge',
+      label: 'SC-Bridge',
+      publicKey: keyPair.publicKey.toString('hex')
+    })
+    
+    // Add agents as nodes
+    agents.forEach(agent => {
+      nodes.push({
+        id: agent.id,
+        type: 'agent',
+        label: agent.name,
+        agentType: agent.type,
+        capabilities: agent.capabilities,
+        publicKey: agent.publicKey
+      })
+      
+      // Add edge from agent to bridge
+      edges.push({
+        source: agent.id,
+        target: 'bridge',
+        type: 'connection'
+      })
+      
+      // Add edges from agent to topics
+      agent.topics.forEach(topicKey => {
+        edges.push({
+          source: agent.id,
+          target: topicKey,
+          type: 'subscription'
+        })
+      })
+    })
+    
+    // Add topics as nodes
+    topics.forEach(topic => {
+      nodes.push({
+        id: topic.key,
+        type: 'topic',
+        label: topic.name,
+        peerCount: topic.peers.size,
+        messageCount: topic.messageCount
+      })
+      
+      // Add edge from topic to bridge
+      edges.push({
+        source: topic.key,
+        target: 'bridge',
+        type: 'hosted'
+      })
+    })
+    
+    res.writeHead(200)
+    res.end(JSON.stringify({
+      nodes: nodes,
+      edges: edges
+    }))
+  }
   else if (req.url === '/clients') {
     const clientList = Array.from(clients).map((ws, idx) => ({
       id: `client-${idx}`,
@@ -177,7 +445,6 @@ const server = http.createServer((req, res) => {
     }))
   }
   else if (req.url === '/topics') {
-    // List all joined topics
     const topicList = Array.from(topics.values()).map(t => ({
       name: t.name,
       key: t.key,
@@ -185,7 +452,9 @@ const server = http.createServer((req, res) => {
       peerCount: t.peers.size,
       joinedAt: t.joinedAt,
       server: t.server,
-      client: t.client
+      client: t.client,
+      messageCount: t.messageCount,
+      lastActivity: t.lastActivity
     }))
     res.writeHead(200)
     res.end(JSON.stringify({
@@ -194,7 +463,6 @@ const server = http.createServer((req, res) => {
     }))
   }
   else if (req.url.startsWith('/topics/')) {
-    // Get specific topic details
     const topicKey = req.url.split('/topics/')[1]
     const topic = topics.get(topicKey)
     
@@ -222,7 +490,9 @@ const server = http.createServer((req, res) => {
       peers: peerDetails,
       joinedAt: topic.joinedAt,
       server: topic.server,
-      client: topic.client
+      client: topic.client,
+      messageCount: topic.messageCount,
+      lastActivity: topic.lastActivity
     }))
   }
   else if (req.url === '/network') {
@@ -231,11 +501,16 @@ const server = http.createServer((req, res) => {
       bridge: {
         publicKey: keyPair.publicKey.toString('hex'),
         uptime: Date.now() - startTime,
-        startedAt: new Date(startTime).toISOString()
+        startedAt: new Date(startTime).toISOString(),
+        mode: 'observatory'
       },
       peers: {
         count: peers.size,
         list: Array.from(peers.keys())
+      },
+      agents: {
+        count: agents.size,
+        list: Array.from(agents.keys())
       },
       clients: {
         count: clients.size
@@ -245,8 +520,13 @@ const server = http.createServer((req, res) => {
         list: Array.from(topics.values()).map(t => ({
           name: t.name,
           key: t.key,
-          peerCount: t.peers.size
+          peerCount: t.peers.size,
+          messageCount: t.messageCount
         }))
+      },
+      messages: {
+        archived: messages.length,
+        total: activity.messagesReceived
       }
     }))
   }
@@ -256,13 +536,21 @@ const server = http.createServer((req, res) => {
       bridge: {
         publicKey: keyPair.publicKey.toString('hex'),
         uptime: process.uptime(),
-        startedAt: new Date(startTime).toISOString()
+        startedAt: new Date(startTime).toISOString(),
+        mode: 'observatory'
       },
       connections: {
         peers: peers.size,
+        agents: agents.size,
         clients: clients.size,
         topics: topics.size,
         total: peers.size + clients.size
+      },
+      activity: {
+        messagesReceived: activity.messagesReceived,
+        messagesSent: activity.messagesSent,
+        agentsDiscovered: activity.agentsDiscovered,
+        topicsDiscovered: activity.topicsDiscovered
       },
       peers: Array.from(peers.values()).map(p => ({
         id: p.publicKey.slice(0, 16) + '...',
@@ -274,12 +562,49 @@ const server = http.createServer((req, res) => {
   else if (req.url === '/info') {
     res.writeHead(200)
     res.end(JSON.stringify({
-      name: 'sc-bridge',
-      version: '2.0.0',
+      name: 'sc-bridge-observatory',
+      version: '3.0.0',
+      mode: 'observatory',
       publicKey: keyPair.publicKey.toString('hex'),
-      capabilities: ['websocket', 'hyperswarm', 'peer-discovery', 'message-relay', 'topic-management'],
-      endpoints: ['/', '/health', '/peers', '/clients', '/topics', '/topics/:key', '/network', '/stats', '/info'],
-      websocketCommands: ['ping', 'list_peers', 'get_stats', 'get_info', 'list_topics', 'join_topic', 'leave_topic']
+      capabilities: [
+        'websocket',
+        'hyperswarm',
+        'peer-discovery',
+        'message-relay',
+        'topic-management',
+        'agent-registry',
+        'message-archival',
+        'network-observatory'
+      ],
+      endpoints: [
+        '/',
+        '/health',
+        '/peers',
+        '/agents',
+        '/agents/:publicKey',
+        '/messages',
+        '/activity',
+        '/graph',
+        '/clients',
+        '/topics',
+        '/topics/:key',
+        '/network',
+        '/stats',
+        '/info'
+      ],
+      websocketCommands: [
+        'ping',
+        'list_peers',
+        'list_agents',
+        'list_messages',
+        'get_stats',
+        'get_info',
+        'list_topics',
+        'join_topic',
+        'leave_topic',
+        'get_activity',
+        'get_graph'
+      ]
     }))
   }
   else {
@@ -292,8 +617,11 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server })
 const clients = new Set()
 
-// Join discovery topic after clients is initialized
-joinTopic(DISCOVERY_TOPIC, { server: true, client: true })
+// Auto-join common agent topics
+console.log('[observatory] Auto-joining common agent topics...')
+AUTO_JOIN_TOPICS.forEach(topicName => {
+  joinTopic(topicName, { server: true, client: true })
+})
 
 wss.on('connection', ws => {
   ws.connectedAt = new Date().toISOString()
@@ -323,12 +651,24 @@ wss.on('connection', ws => {
     }))
   }
   
+  // Send current agent registry
+  const agentList = Array.from(agents.values())
+  if (agentList.length > 0) {
+    ws.send(JSON.stringify({
+      type: 'agent-list',
+      id: 'evt-' + Date.now(),
+      timestamp: new Date().toISOString(),
+      payload: { agents: agentList }
+    }))
+  }
+  
   // Send current topic list
   const topicList = Array.from(topics.values()).map(t => ({
     name: t.name,
     key: t.key,
     peerCount: t.peers.size,
-    joinedAt: t.joinedAt
+    joinedAt: t.joinedAt,
+    messageCount: t.messageCount
   }))
   
   if (topicList.length > 0) {
@@ -363,13 +703,92 @@ wss.on('connection', ws => {
           payload: { peers: peerData }
         }))
       }
+      else if (d.type === 'list_agents') {
+        // NEW: List all discovered agents
+        const agentData = Array.from(agents.values())
+        ws.send(JSON.stringify({
+          type: 'agent-list',
+          id: 'evt-' + Date.now(),
+          timestamp: new Date().toISOString(),
+          payload: { agents: agentData }
+        }))
+      }
+      else if (d.type === 'list_messages') {
+        // NEW: List recent messages
+        const limit = d.payload?.limit || 100
+        const recentMessages = messages.slice(-limit)
+        ws.send(JSON.stringify({
+          type: 'message-list',
+          id: 'evt-' + Date.now(),
+          timestamp: new Date().toISOString(),
+          payload: { messages: recentMessages }
+        }))
+      }
+      else if (d.type === 'get_activity') {
+        // NEW: Get activity metrics
+        const uptime = Date.now() - activity.startTime
+        const messagesPerSecond = activity.messagesReceived / (uptime / 1000)
+        
+        ws.send(JSON.stringify({
+          type: 'activity',
+          id: 'evt-' + Date.now(),
+          timestamp: new Date().toISOString(),
+          payload: {
+            uptime: uptime,
+            messagesReceived: activity.messagesReceived,
+            messagesSent: activity.messagesSent,
+            messagesPerSecond: messagesPerSecond.toFixed(2),
+            agentsDiscovered: activity.agentsDiscovered,
+            topicsDiscovered: activity.topicsDiscovered,
+            currentAgents: agents.size,
+            currentTopics: topics.size
+          }
+        }))
+      }
+      else if (d.type === 'get_graph') {
+        // NEW: Get network graph
+        const nodes = []
+        const edges = []
+        
+        nodes.push({
+          id: 'bridge',
+          type: 'bridge',
+          label: 'SC-Bridge'
+        })
+        
+        agents.forEach(agent => {
+          nodes.push({
+            id: agent.id,
+            type: 'agent',
+            label: agent.name
+          })
+          edges.push({ source: agent.id, target: 'bridge' })
+        })
+        
+        topics.forEach(topic => {
+          nodes.push({
+            id: topic.key,
+            type: 'topic',
+            label: topic.name
+          })
+          edges.push({ source: topic.key, target: 'bridge' })
+        })
+        
+        ws.send(JSON.stringify({
+          type: 'graph',
+          id: 'evt-' + Date.now(),
+          timestamp: new Date().toISOString(),
+          payload: { nodes, edges }
+        }))
+      }
       else if (d.type === 'list_topics') {
         const topicData = Array.from(topics.values()).map(t => ({
           name: t.name,
           key: t.key,
           peerCount: t.peers.size,
           peers: Array.from(t.peers),
-          joinedAt: t.joinedAt
+          joinedAt: t.joinedAt,
+          messageCount: t.messageCount
         }))
         ws.send(JSON.stringify({
           type: 'topic-list',
@@ -423,8 +842,10 @@ wss.on('connection', ws => {
           timestamp: new Date().toISOString(),
           payload: {
             peers: peers.size,
+            agents: agents.size,
             clients: clients.size,
             topics: topics.size,
+            messages: messages.length,
             uptime: process.uptime()
           }
         }))
@@ -436,7 +857,17 @@ wss.on('connection', ws => {
           timestamp: new Date().toISOString(),
           payload: {
             publicKey: keyPair.publicKey.toString('hex'),
-            capabilities: ['websocket', 'hyperswarm', 'peer-discovery', 'message-relay', 'topic-management']
+            mode: 'observatory',
+            capabilities: [
+              'websocket',
+              'hyperswarm',
+              'peer-discovery',
+              'message-relay',
+              'topic-management',
+              'agent-registry',
+              'message-archival',
+              'network-observatory'
+            ]
           }
         }))
       }
@@ -482,6 +913,18 @@ swarm.on('connection', (conn, info) => {
     console.log(`[swarm] peer ${peerId.slice(0, 8)} joined topic ${topicKey.slice(0, 16)}`)
   }
   
+  // Register as agent (basic registration from peer connection)
+  registerAgent({
+    publicKey: peerId,
+    name: `Peer-${peerId.slice(0, 8)}`,
+    type: 'peer',
+    topics: Array.from(peer.topics),
+    metadata: {
+      client: info.client || false,
+      server: info.server || false
+    }
+  })
+  
   // Notify all frontend clients about the new peer
   const joinEvent = JSON.stringify({
     type: 'agent-join',
@@ -498,12 +941,9 @@ swarm.on('connection', (conn, info) => {
     }
   })
   
-  // Only notify clients if they exist (after WebSocket server is initialized)
-  if (typeof clients !== 'undefined') {
-    clients.forEach(ws => {
-      if (ws.readyState === 1) ws.send(joinEvent)
-    })
-  }
+  clients.forEach(ws => {
+    if (ws.readyState === 1) ws.send(joinEvent)
+  })
   
   conn.on('data', data => {
     // Update last seen
@@ -512,15 +952,46 @@ swarm.on('connection', (conn, info) => {
     let msg
     try {
       msg = JSON.parse(data.toString())
+      
+      // Check for agent announcement
+      if (msg.type === 'agent-announce' || msg.type === 'agent-metadata') {
+        registerAgent({
+          publicKey: peerId,
+          name: msg.payload?.name || msg.name,
+          type: msg.payload?.type || msg.type,
+          capabilities: msg.payload?.capabilities || msg.capabilities || [],
+          topics: Array.from(peer.topics),
+          metadata: msg.payload?.metadata || msg.metadata || {}
+        })
+      }
+      
+      // Archive message
+      archiveMessage({
+        ...msg,
+        topic: topicKey || 'unknown',
+        sender: peerId
+      })
+      
     } catch {
+      // Non-JSON message
       msg = {
         type: 'message',
         id: 'evt-' + Date.now(),
         timestamp: new Date().toISOString(),
         payload: { source: peerId, raw: data.toString('hex').slice(0, 64) }
       }
+      
+      archiveMessage({
+        id: msg.id,
+        timestamp: msg.timestamp,
+        topic: topicKey || 'unknown',
+        sender: peerId,
+        content: data.toString('hex').slice(0, 64),
+        metadata: { raw: true }
+      })
     }
     
+    // Broadcast to WebSocket clients
     clients.forEach(ws => {
       if (ws.readyState === 1) ws.send(JSON.stringify(msg))
     })
@@ -537,7 +1008,12 @@ swarm.on('connection', (conn, info) => {
       })
     }
     
-    // Remove peer from tracking
+    // Update agent last seen (don't remove from registry)
+    if (agents.has(peerId)) {
+      agents.get(peerId).lastSeen = new Date().toISOString()
+    }
+    
+    // Remove peer from active tracking
     peers.delete(peerId)
     
     const leaveEvent = JSON.stringify({
@@ -558,8 +1034,9 @@ swarm.on('connection', (conn, info) => {
 })
 
 server.listen(8080, () => {
-  console.log('[sc-bridge] ready — public key:', keyPair.publicKey.toString('hex'))
-  console.log('[sc-bridge] HTTP + WebSocket listening on :8080')
-  console.log('[sc-bridge] Endpoints: /, /health, /peers, /clients, /topics, /network, /stats, /info')
-  console.log('[sc-bridge] Discovery topic:', DISCOVERY_TOPIC)
+  console.log('[sc-bridge-observatory] ready — public key:', keyPair.publicKey.toString('hex'))
+  console.log('[sc-bridge-observatory] HTTP + WebSocket listening on :8080')
+  console.log('[sc-bridge-observatory] Mode: NETWORK OBSERVATORY')
+  console.log('[sc-bridge-observatory] Auto-joined topics:', AUTO_JOIN_TOPICS.join(', '))
+  console.log('[sc-bridge-observatory] Endpoints: /, /health, /peers, /agents, /messages, /activity, /graph, /clients, /topics, /network, /stats, /info')
 })
