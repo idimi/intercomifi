@@ -7,6 +7,7 @@ const fs = require('fs')
 // Persist keypair across restarts (volume mount at /data)
 const KEYFILE = '/data/swarm.key'
 let keyPair
+
 if (fs.existsSync(KEYFILE)) {
   const seed = fs.readFileSync(KEYFILE)
   keyPair = crypto.keyPair(seed)
@@ -57,12 +58,49 @@ wss.on('connection', ws => {
 })
 
 swarm.on('connection', (conn, info) => {
-  console.log('[swarm] peer connected:', info.publicKey.toString('hex').slice(0, 8))
+  const peerId = info.publicKey.toString('hex')
+  console.log('[swarm] peer connected:', peerId.slice(0, 8))
+  
+  // Notify all frontend clients about the new peer
+  const joinEvent = JSON.stringify({
+    type: 'agent-join',
+    id: 'evt-' + Date.now(),
+    timestamp: new Date().toISOString(),
+    payload: { agentId: peerId, publicKey: peerId }
+  })
+  
+  clients.forEach(ws => {
+    if (ws.readyState === 1) ws.send(joinEvent)
+  })
   
   conn.on('data', data => {
-    // Broadcast raw P2P events to all connected frontends
+    let msg
+    try {
+      msg = JSON.parse(data.toString())
+    } catch {
+      msg = {
+        type: 'message',
+        id: 'evt-' + Date.now(),
+        timestamp: new Date().toISOString(),
+        payload: { source: peerId, raw: data.toString('hex').slice(0, 64) }
+      }
+    }
+    
     clients.forEach(ws => {
-      if (ws.readyState === 1) ws.send(data.toString())
+      if (ws.readyState === 1) ws.send(JSON.stringify(msg))
+    })
+  })
+  
+  conn.on('close', () => {
+    const leaveEvent = JSON.stringify({
+      type: 'agent-leave',
+      id: 'evt-' + Date.now(),
+      timestamp: new Date().toISOString(),
+      payload: { agentId: peerId }
+    })
+    
+    clients.forEach(ws => {
+      if (ws.readyState === 1) ws.send(leaveEvent)
     })
   })
   
