@@ -53,7 +53,9 @@ const AUTO_JOIN_TOPICS = [
   'agent-marketplace',
   'agent-announce',
   'intercom-global',
-  'agent-network'
+  'agent-network',
+  '0000intercom',
+  'agents-services'
 ]
 
 // Helper: Create topic key from name
