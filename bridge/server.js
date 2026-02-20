@@ -91,13 +91,16 @@ const relayChannels = new Map() // channelName -> Set of ws clients
 
 // Helper: Generate topic key from name
 function getTopicKey(name) {
-  return b4a.toString(crypto.discoveryKey(b4a.from(name, 'utf-8')), 'hex')
+  const topicBuffer = Buffer.alloc(32)
+  topicBuffer.write(name)
+  return b4a.toString(crypto.discoveryKey(topicBuffer), 'hex')
 }
 
 // Helper: Join a Hyperswarm topic
 function joinTopic(name, options = {}) {
   const { server = true, client = true } = options
-  const topicBuffer = b4a.from(name, 'utf-8')
+  const topicBuffer = Buffer.alloc(32)
+  topicBuffer.write(name)
   const topicKey = getTopicKey(name)
   
   if (topics.has(topicKey)) {
